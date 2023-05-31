@@ -1,0 +1,271 @@
+#!/bin/bash
+#
+# File: setup-pk-local
+#
+# Test tool for conferring polkit console privileges on
+# remote sessions
+#
+#  Copyright 2023 Matt Burt
+#
+#  Licensed under the Apache License, Version 2.0 (the "License");
+#  you may not use this file except in compliance with the License.
+#  You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
+
+PKACTION=/usr/bin/pkaction
+GROUP=pk-local
+RULES_PRIORITY=50
+POLKIT_RULES_DIR=/etc/polkit-1/rules.d
+POLKIT_PKLA_DIR=/etc/polkit-1/localauthority/50-local.d
+
+export LANG=C
+
+declare MODE=   ; # 'RULES' or 'PKLA'
+
+# ------------------------------------------------------------------------------
+# Functions to generate the output file in RULES mode
+# ------------------------------------------------------------------------------
+output_header_RULES()
+{
+    echo 'polkit.addRule(function(action, subject) {'
+    echo $'\tvar result = null;'
+    echo $'\tif (subject.isInGroup("'$GROUP'") && !subject.local) {'
+    echo $'\t\tswitch (action.id) {'
+}
+
+output_action_RULES()
+{
+    local action=$1
+    local override=$2
+    local original=$3
+    echo $'\t\t\tcase "'$action'":'
+    echo $'\t\t\t\tresult = "'$override'";  // was "'$original'"'
+    echo $'\t\t\t\tbreak;'
+}
+
+output_footer_RULES()
+{
+    local override_count=$1
+    local total_count=$2
+
+    echo $'\t\t}'
+    echo $'\t\tif (result != null) {'
+    echo $'\t\t\tpolkit.log("'$GROUP': action=" + action + " user=" + subject.user + " override=" + result);'
+    echo $'\t\t}'
+    echo $'\t}'
+    echo $'\treturn result;'
+    echo '});'
+    echo
+    echo '// Overrode '$override_count' actions from a total of '$total_count
+}
+
+# ------------------------------------------------------------------------------
+# Functions to generate the output file in PKLA mode
+# ------------------------------------------------------------------------------
+output_header_PKLA()
+{
+    :
+}
+
+output_action_PKLA()
+{
+    local action=$1
+    local override=$2
+    local original=$3
+    echo '[pk-local override for '$action']'
+    echo 'Identity=unix-group:'$GROUP
+    echo 'Action='$action
+    echo '#ResultAny='$original
+    echo 'ResultAny='$override
+    echo
+}
+
+output_footer_PKLA()
+{
+    local override_count=$1
+    local total_count=$2
+
+    echo '# Overrode '$override_count' actions from a total of '$total_count
+}
+
+# ------------------------------------------------------------------------------
+# Determine which mode we are running in
+#
+# Polkit versions up to 0.105 uses pkla files, and later versions use rules
+#
+# Result on stdout, errors on stderr
+# ------------------------------------------------------------------------------
+determine_mode()
+{
+    set -- $($PKACTION --version)
+    if [[ $# -lt 3 ]]; then
+        echo "** Can't determine Polkit version" >&2
+    else
+        case "$3" in
+            0.105)  echo PKLA
+                    ;;
+            0.*)    echo "** PolicyKit versions before 0.105 are not supported" >&2
+                    ;;
+            *)      echo RULES
+                    ;;
+        esac
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# M A I N
+# ------------------------------------------------------------------------------
+declare MODE=$(determine_mode)
+if [[ -z $MODE ]]; then
+    exit 1
+fi
+
+# ------------------------------------------------------------------------------
+# Find output file and directory
+# ------------------------------------------------------------------------------
+
+if [[ $(id -u) != 0 ]]; then
+    echo "** Warning: You do not appear to be running with privilege" >&2
+fi
+
+if [[ $MODE == RULES ]]; then
+    declare output_dir=$POLKIT_RULES_DIR
+    declare output_file="$output_dir/${RULES_PRIORITY}-pk-local.rules"
+else
+    declare output_dir=$POLKIT_PKLA_DIR
+    declare output_file="$output_dir/pk-local.pkla"
+fi
+
+if [[ ! -d $output_dir ]]; then
+    echo "** Can't find output dir $output_dir." >&2
+    exit 1
+fi
+
+# ------------------------------------------------------------------------------
+# Work out what we're doing
+# ------------------------------------------------------------------------------
+if [[ $1 == --enable ]]; then
+    if [[ -f $output_file ]]; then
+        echo "** Can't overwrite existing file '$output_file'" >&2
+        exit 1
+    fi
+    # Continue to rest of script
+
+elif [[ $1 == --disable ]]; then
+    if [[ -f $output_file ]]; then
+        echo "- Removing generated polkit overrides in $output_file"
+        rm "$output_file"
+    else
+        :
+    fi
+    exit $?
+else
+    echo "** Specify '--enable' or '--disable' as the argument to this script" >&2
+    exit 1
+fi
+
+# ------------------------------------------------------------------------------
+# Create the output file with a temporary suffix
+# ------------------------------------------------------------------------------
+declare temp_file=$(mktemp $output_file.XXXXXXXXXX)
+if [[ -z $temp_file ]]; then
+    echo "** Unable to create temporary file $temp_file" >&2
+    exit 1
+fi
+
+chmod 644 $temp_file
+exec 3>>$temp_file || {
+    echo "** Unable to write to temporary file $temp_file" >&2
+    rm $temp_file
+    exit 1
+}
+
+echo "- Generating $temp_file...">&2
+
+declare action=
+declare implicit_any=
+declare implicit_active=
+
+IFS=''
+output_header_$MODE >&3
+declare -i total_actions=0
+declare -i processed_actions=0
+
+while read line; do
+    if [[ -n $line && ${line:0:1} != ' ' && ${line: -1:1} == ':' ]];then
+        action=${line%:}
+        implicit_any=
+        implicit_active=
+        continue
+    fi
+
+    unset IFS
+    set -- $line
+    IFS=''
+
+    if [[ $# != 3 || $1 != implicit ]]; then
+        continue
+    fi
+
+    case "$2" in
+        "any:") implicit_any="$3" ;;
+        "active:") implicit_active="$3" ;;
+    esac
+
+    if [[ -n $action && -n $implicit_any && -n $implicit_active ]]; then
+        ((++total_actions))
+        if [[ $implicit_any != $implicit_active ]]; then
+            output_action_$MODE $action $implicit_active $implicit_any >&3
+            ((++processed_actions))
+        fi
+        action=
+    fi
+done < <($PKACTION --verbose)
+
+output_footer_$MODE $processed_actions $total_actions >&3
+
+exec 3>&-
+
+# ------------------------------------------------------------------------------
+# Rename the file
+# ------------------------------------------------------------------------------
+mv $temp_file $output_file || {
+    echo "** Can't rename $temp_file" >&2
+    exit 1
+}
+echo "- Renamed $temp_file to $output_file">&2
+
+cat <<EOF
+
+  All users in group '$GROUP' now have console privileges when logged in
+  from anywhere, over any connection.
+
+   ***************************************************************************
+   ** This is intended for testing purposes only.                           **
+   **                                                                       **
+   ** DO NOT expose systems set up in this manner to wider networks,        **
+   ** particularly the Internet. Anyone obtaining access to your system via **
+   ** a user in group '$GROUP' may be able to obtain complete control     **
+   ** of your system, and the information it contains.                      **
+   ***************************************************************************
+
+  To reverse this operaton, re-run the script with the --disable switch
+EOF
+
+declare groupdef=$(getent group $GROUP)
+if [[ -z $groupdef ]]; then
+    echo
+    echo "** group '$GROUP' does not exist"
+    echo "** To use this facility, create group $GROUP and add users to it"
+else
+    echo
+    echo "Current users in group $GROUP : "${groupdef##*:}
+
+fi
